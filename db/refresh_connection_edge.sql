@@ -1,16 +1,49 @@
 USE AxiNetStat;
 GO
 
+IF OBJECT_ID('dbo.connection_enrichment_watermark', 'U') IS NULL
+BEGIN
+    CREATE TABLE dbo.connection_enrichment_watermark (
+        id tinyint NOT NULL CONSTRAINT PK_connection_enrichment_watermark PRIMARY KEY,
+        raw_id bigint NOT NULL,
+        CONSTRAINT CK_connection_enrichment_watermark_id CHECK (id = 1)
+    );
+    INSERT INTO dbo.connection_enrichment_watermark (id, raw_id) VALUES (1, 0);
+END;
+GO
+
 CREATE OR ALTER PROCEDURE dbo.refresh_connection_edge
+    @rebuild bit = 0
 AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
-    EXEC dbo.refresh_host_alias_map;
-
     BEGIN TRY
         BEGIN TRANSACTION;
+
+        DECLARE @last_raw_id bigint, @next_raw_id bigint;
+        SELECT @last_raw_id = raw_id
+        FROM dbo.connection_enrichment_watermark WITH (UPDLOCK, HOLDLOCK)
+        WHERE id = 1;
+
+        IF @rebuild = 1 SET @last_raw_id = 0;
+
+        SELECT @next_raw_id = ISNULL(MAX(id), 0) FROM dbo.connection_raw;
+        IF @next_raw_id <= @last_raw_id
+        BEGIN
+            COMMIT TRANSACTION;
+            RETURN;
+        END;
+
+        SELECT DISTINCT observed_date = CAST(DateAdded AS date)
+        INTO #affected_days
+        FROM dbo.connection_raw
+        WHERE id > @last_raw_id AND id <= @next_raw_id;
+
+        CREATE UNIQUE CLUSTERED INDEX IX_affected_days ON #affected_days (observed_date);
+
+        EXEC dbo.refresh_host_alias_map;
 
         ;WITH latest_node_raw AS (
             SELECT
@@ -89,6 +122,10 @@ BEGIN
                 target_ephemeral_port_start_raw = 49152,
                 target_ephemeral_port_end_raw = 65535
             FROM dbo.connection_raw r
+            INNER JOIN #affected_days changed
+                ON r.DateAdded >= CAST(changed.observed_date AS datetime2)
+               AND r.DateAdded < DATEADD(day, 1, CAST(changed.observed_date AS datetime2))
+               AND r.id <= @next_raw_id
             LEFT JOIN node_ranges source_range
                 ON source_range.ciid = NULLIF(LTRIM(RTRIM(r.reporter_ciid)), '')
             OUTER APPLY (
@@ -394,6 +431,10 @@ BEGIN
             END,
             DateAdded
         FROM merged_rows;
+
+        UPDATE dbo.connection_enrichment_watermark
+        SET raw_id = @next_raw_id
+        WHERE id = 1;
 
         COMMIT TRANSACTION;
     END TRY

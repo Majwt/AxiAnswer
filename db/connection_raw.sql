@@ -1,6 +1,7 @@
 USE AxiNetStat;
 GO
 
+DROP TABLE IF EXISTS dbo.connection_enrichment_watermark;
 DROP TABLE IF EXISTS dbo.connection_raw;
 GO
 
